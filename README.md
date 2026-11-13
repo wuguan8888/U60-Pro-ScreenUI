@@ -4,23 +4,25 @@
 
 本仓库**不是** Web 控制台的分支，也不包含中兴原厂固件。它是一层加载到原厂桌面程序里的扩展，通过 [peter5842/U60-Pro-WebUI](https://github.com/peter5842/U60-Pro-WebUI) 的 agent 接口读写设备状态。U60-Pro-WebUI 本身是 [dklasens/MU5250-OpenUI](https://github.com/dklasens/MU5250-OpenUI) 的分支，并可追溯到 [jesther-ai/open-u60-pro](https://github.com/jesther-ai/open-u60-pro)。
 
-当前预编译版本：`screen.so` sha256 `55a8ae8b04cd9796c20b65d44848c05fa6700e3566cfdf5a524d59a3aacde5bb`。下面的界面图由测试里记录的真实控件树离线渲染，布局和文案与设备上一致，但不是真机拍照。
+当前预编译版本：`screen.so` sha256 `21cb72412b51a7c2b66289df061feeab72725f4230fefd5ea945c509a7bcdc99`。下面的界面图由测试里记录的真实控件树离线渲染，布局和文案与设备上一致，但不是真机拍照。
 
 | 概览 | 测速完成 |
 |---|---|
 | ![概览](preview/a-overview.png) | ![测速完成](preview/f-speed-done.png) |
 | 代理 | 锁频 |
 | ![代理](preview/b-proxy.png) | ![锁频](preview/c-bandlock.png) |
-| 锁小区 | 确认下发 |
-| ![锁小区](preview/d-celllock.png) | ![只使用 n78 的确认框](preview/e2-confirm-only-n78.png) |
+| 锁小区 | 扫描结果 |
+| ![锁小区](preview/d-celllock.png) | ![扫描结果](preview/d4-scan-results.png) |
+| 扫描确认 | 锁频确认 |
+| ![扫描附近小区确认框](preview/d2-scan-confirm.png) | ![只使用 n78 的确认框](preview/e2-confirm-only-n78.png) |
 
-更多画面：[测速进行中](preview/f-speed-running.png)、[已下发](preview/f1-result-sent.png)、[设备已确认](preview/f2-result-confirmed.png)、[下发失败](preview/f3-result-failed.png)。
+更多画面：[测速进行中](preview/f-speed-running.png)、[扫描中](preview/d3-scan-running.png)、[无附近小区](preview/d5-scan-empty.png)、[已下发](preview/f1-result-sent.png)、[设备已确认](preview/f2-result-confirmed.png)、[下发失败](preview/f3-result-failed.png)。
 
 ## 和 Web 后台的关系
 
 [U60-Pro-WebUI](https://github.com/peter5842/U60-Pro-WebUI) 提供设备上的 Rust agent（默认 `http://192.168.0.1:9090`）和浏览器里的 React 控制台（默认 `:8080`）。概览、锁频、锁小区、代理这些能力，后台里大多已经有了。
 
-本项目做的是另一层：**把常用操作做到设备自己的屏幕上**，不打开电脑或手机也能看信号、切节点、锁频和测速。屏幕扩展会用设备里已有的 agent 密码登录（`/data/local/tmp/start_zte_agent.sh` 中的 `ZTE_AGENT_PASSWORD`），再带 Bearer token 调用接口。它不会绕过后台登录，也不会改你的密码。
+本项目做的是另一层：**把常用操作做到设备自己的屏幕上**，不打开电脑或手机也能看信号、切节点、锁频、扫描附近小区和测速。屏幕扩展会用设备里已有的 agent 密码登录（`/data/local/tmp/start_zte_agent.sh` 中的 `ZTE_AGENT_PASSWORD`），再带 Bearer token 调用接口。它不会绕过后台登录，也不会改你的密码。
 
 当前实现针对的是：
 
@@ -40,7 +42,7 @@
 - **测速**（在概览页）：大字号 Mbps 和「测速 / 停止」按钮。下载在独立线程进行，最长 10 秒或 50 MB，可随时停止；实时显示速度、已下载量和延迟。延迟是对 `223.5.5.5:53` 做 3 次 TCP 握手取中位数，不做上传测试。结果会附上开始时的网络类型、频段、PCI 和 SINR，内存中保留最近 5 次。两次测速至少间隔 30 秒；测速和锁频/锁小区不能同时进行。测速固定走蜂窝网卡直连（绑定 WAN 接口及其 IPv4，自建 DNS，拒绝 `198.18.0.0/15` 的 fake-ip），不经过 mihomo 代理；直连失败就报失败，不会改走代理。默认地址是阿里云 Ubuntu 镜像，备选华为云镜像。
 - **代理**：切换工作模式、当前节点，以及原有的节点测速。这一页沿用扩展里已有的代理界面。
 - **锁频**：NR(SA) / LTE 两个标签。频段列表来自 `/api/modem/capabilities`。绿点是正在服务的频段，黄线是当前锁定，蓝底是草稿。点芯片只改草稿；「应用锁频」和「恢复自动」都要先出现确认框，点「确认下发」才会真正发送。若设备当前是自动（锁定集合等于全部支持频段；LTE 以掩码 `0x87e29a0e00df` 判断），草稿从空开始，点选表示「只使用」这些频段；空草稿不能下发。所选频段本机从未见过信号时，确认框会红字提示可能断网。
-- **锁小区**：只列出当前正在服务的载波（PCC / SCC）。选一行后「锁定 PCI」或「解除锁定」，同样要确认后才发送。
+- **锁小区**：列出当前正在服务的载波（PCC / SCC），右上角有「扫描」。点「扫描」先出现确认框，写明可能短暂断网，或从 5G SA 掉回 LTE；取消则不会扫描，确认后才扫一次（不会自动重试）。结果按 RSRP 从强到弱列出附近小区的 RAT、频段（如 n78 / B8）、PCI 和强度（RSRP，以及固件提供的 RSRQ/SINR）。同时也是当前服务小区的会标「在用」。空结果会显示「无附近小区」。点扫描行可选中，再「锁定 PCI」仍要走原来的两步确认。打开页面不会自动扫描。扫描中不能同时进行锁频、锁定或测速。
 - **结果流程**：下发中 → 每 2 秒读回一次（最多约 30 秒）→ 一致则显示绿色「设备已确认」；超时不一致则显示红色「未生效」和读回值，可手动重试；agent 拒绝则显示原因。确认框打开或请求进行中时，不会再接受新的锁定操作。锁定请求每次确认只发一次，**不会自动重试**。
 
 屏幕上没有重启、关机、USB 模式、结束进程或 AT 命令入口。
@@ -55,11 +57,11 @@
         │  LD_PRELOAD=/data/u60-screen/screen.so
         │  （仅当 /data/u60-screen/enabled 存在，且桌面程序哈希匹配）
         │
-        │  HTTP + Bearer
-        │  登录：POST /api/auth/login
-        ▼
- zte-agent :9090     ← U60-Pro-WebUI
-        │
+        │  HTTP + Bearer                  邻区扫描（工作线程）
+        │  登录：POST /api/auth/login         ubus zte_nwinfo_api
+        ▼                                    nwinfo_scan_nbr
+ zte-agent :9090  ← U60-Pro-WebUI            nwinfo_get_nr5g_nbr_contents
+        │                                    nwinfo_get_lte_nbr_contents
         ├─ ubus / 基带     信号、锁频、锁小区
         ├─ sysfs / proc    电量、温度、流量
         └─ mihomo          代理模式和节点
@@ -84,7 +86,9 @@
 
 登录失败后 30 秒内不会再试。读请求遇到 401/403 会重新登录一次再读；锁定 POST 遇到 401 **不会**重新登录后自动重发，以免重复改基带。
 
-对象池是静态的，页面控件不会在运行时新建。当前占用 415 / 431（概览 43、代理 175、锁频 129、锁小区 46、浮层 18、圆点 4）。
+邻区扫描不经过 agent：当前 U60-Pro-WebUI 没有对应的 HTTP 接口，所以 `screen.so` 在工作线程里直接调用固件 `ubus`（`zte_nwinfo_api` 的 `nwinfo_scan_nbr`、`nwinfo_get_nr5g_nbr_contents`、`nwinfo_get_lte_nbr_contents`）。记录格式与原厂 WebUI 一致：`PCI,ARFCN,band,RSRP[,RSRQ[,SINR]];…`。扫描本身不会自动重试；若扫描成功但列表暂时为空，最多再隔 3 秒读取内容 3 次。因此只需更新 `screen.so`，不必改 agent。
+
+对象池是静态的，页面控件不会在运行时新建。当前占用 465 / 481（概览 43、代理 175、锁频 129、锁小区 96、浮层 18、圆点 4）。
 
 ## 安装
 
@@ -185,15 +189,15 @@ sha256sum -c SHA256SUMS   # 若你改过 screen.c，哈希会变，属正常
 ./tests/run_tests.sh
 ```
 
-在本机用 AddressSanitizer / UBSan 编译运行，预期 **104 + 179** 项通过。同一套测试也可以交叉编译成 aarch64 musl 静态程序，在 qemu 里跑，结果应相同。覆盖范围包括 JSON 解析、锁频草稿（含「自动 = 全部频段」）、确认门控（不确认绝不 POST）、401 不重发锁定请求、对象池预算、6 页滑动，以及测速与锁定互斥等。预览图可用 `tools/render_preview.py` 根据 `tests/preview/*.json` 再画一次。
+在本机用 AddressSanitizer / UBSan 编译运行，预期 **104 + 205** 项通过。邻区扫描的测试走 ubus 替身，不会调用真实 ubus，也不会对设备做扫描。覆盖范围包括 JSON 解析、锁频草稿（含「自动 = 全部频段」）、确认门控（不确认绝不 POST 或扫描）、401 不重发锁定请求、对象池预算、6 页滑动，以及测速、锁定与扫描互斥等。预览图可用 `tools/render_preview.py` 根据 `tests/preview/*.json` 再画一次。
 
 ## 风险和限制
 
 - **锁频、锁小区会改基带**：确认后设备会断网重搜。锁到当前环境没有的频段或小区，会一直没网，直到「恢复自动」或「解除锁定」。
+- **邻区扫描可能短暂断网**，或从 5G SA 掉回 LTE。确认框里写明了这一点；扫描不会自动重试。扫描只能反映当时搜到的小区，没有信号的频段不会出现在列表里。
 - **测速消耗蜂窝流量**，并短时占用下行带宽，最多约 50 MB。
 - **固件升级**：桌面程序哈希一变，扩展会自动停用，退回原厂界面。
 - **崩溃循环**：procd 的 respawn 为 `3600 5 5`，短时间连续崩溃 5 次后不再拉起，屏幕可能停在黑屏。SSH 一般仍可用，按「完全关闭扩展」恢复。
-- 锁小区只列出当前服务小区，不扫描邻区。
 - 频段芯片每个标签最多显示 28 个；更多频段仍可留在草稿里，只是不显示。
 - 本仓库不包含、也不分发中兴原厂固件或 `zte_topsw_devui` 本体。这是非官方项目，使用风险自负。
 

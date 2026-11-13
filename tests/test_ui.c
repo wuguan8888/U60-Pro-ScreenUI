@@ -37,6 +37,9 @@ static void world(const char *preset) {
     lk_state = LS_IDLE; lk_confirmed = 0; lk_op.kind = LK_NONE; lk_polls = 0; lk_reason[0] = lk_readback[0] = 0;
     memset(drafts, 0, sizeof drafts); memset(seen_band, 0, sizeof seen_band); band_tab = 0; cell_sel_rat = 0; cell_sel_pci = -1; cell_sel_arfcn = -1; cell_last_req[0] = 0;
     busy_op = OP_NONE; note[0] = 0;
+    sc_state = SC_IDLE; sc_req = 0; sc_n = 0; sc_calls = 0; sc_phase[0] = 0; sc_err[0] = 0;
+    memset(sc_list, 0, sizeof sc_list);
+    ubus_hook = NULL; scan_wait_hook = NULL;
     pthread_mutex_unlock(&lock);
     refresh_state(); refresh_caps(); refresh_dash(); refresh_clients();
     render_all();
@@ -59,6 +62,50 @@ static void dump(const char *name, int pg, const char *title) {
 }
 static int64_t wall_ms(void) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000; }
 static void finish_verify(int max) { for (int i = 0; i < max; i++) { pthread_mutex_lock(&lock); int s = lk_state; pthread_mutex_unlock(&lock); if (s != LS_VERIFY) break; verify_step(); } render_all(); }
+
+static int test_scan_n, test_get_lte_n, test_get_nr_n, test_wait_n, test_fail_scan, test_empty_both;
+static const char *test_lte_blob, *test_nr_blob;
+static int test_ubus_hook(const char *svc, const char *method, const char *args, char *out, size_t outlen, int timeout_s) {
+    (void)args; (void)timeout_s;
+    if (strcmp(svc, "zte_nwinfo_api")) return -1;
+    if (!strcmp(method, "nwinfo_scan_nbr")) {
+        test_scan_n++;
+        if (test_fail_scan) return -1;
+        snprintf(out, outlen, "{}");
+        return 0;
+    }
+    if (!strcmp(method, "nwinfo_get_lte_nbr_contents")) {
+        test_get_lte_n++;
+        if (test_empty_both) { snprintf(out, outlen, "{\"lte_nbr_contents\":\"\"}"); return 0; }
+        snprintf(out, outlen, "{\"lte_nbr_contents\":\"%s\"}", test_lte_blob ? test_lte_blob : "");
+        return 0;
+    }
+    if (!strcmp(method, "nwinfo_get_nr5g_nbr_contents")) {
+        test_get_nr_n++;
+        if (test_empty_both) { snprintf(out, outlen, "{\"nr5g_nbr_contents\":\"\"}"); return 0; }
+        snprintf(out, outlen, "{\"nr5g_nbr_contents\":\"%s\"}", test_nr_blob ? test_nr_blob : "");
+        return 0;
+    }
+    return -1;
+}
+static void test_scan_wait(int ms) { (void)ms; test_wait_n++; }
+static void test_scan_hook_reset(void) {
+    test_scan_n = test_get_lte_n = test_get_nr_n = test_wait_n = 0;
+    test_fail_scan = test_empty_both = 0;
+    test_lte_blob = "253,3500,8,-75,-10,12;252,3500,8,-85,-12,5;";
+    test_nr_blob = "412,627264,78,-86,-11,18;";
+    ubus_hook = test_ubus_hook;
+    scan_wait_hook = test_scan_wait;
+}
+static int sc_go(void) {
+    if (!tap(42)) return 0;
+    if (lk_state != LS_CONFIRM) return 0;
+    if (!tap(51)) return 0;
+    pthread_mutex_lock(&lock); int ok = sc_state == SC_RUN && sc_req; sc_req = 0; pthread_mutex_unlock(&lock);
+    if (ok) scan_run();
+    render_all();
+    return ok;
+}
 
 /* ---------- 测速 (overview speed test) ---------- */
 static void *st_bg(void *u) { (void)u; st_run(); return NULL; }
@@ -275,7 +322,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < BAND_CHIPS; i++) ids_ok &= W(bd_chip[i])->user == 200 + i && W(bd_chip_cap[i])->user == 200 + i;
     for (int i = 0; i < CELL_ROWS; i++) ids_ok &= W(cl_row[i])->user == 300 + i;
     CHECK(ids_ok && W(bd_apply)->user == 33 && W(bd_reset)->user == 32 && W(cl_lock)->user == 41 && W(cl_reset)->user == 40 &&
-          W(dl_ok)->user == 51 && W(dl_cancel)->user == 50 && W(ov_proxy)->user == 20, "tap ids wired");
+          W(cl_scan)->user == 42 && W(dl_ok)->user == 51 && W(dl_cancel)->user == 50 && W(ov_proxy)->user == 20, "tap ids wired");
 
     /* ---------- navigation: 6 pages, dots, swipe exclusion ---------- */
     goto_page(PG_CELL, 0);
@@ -576,7 +623,8 @@ int main(int argc, char **argv) {
     int rows = 0; for (int i = 0; i < CELL_ROWS; i++) rows += !(W(cl_row[i])->flags & HIDDEN);
     CHECK(rows == 3 && !strcmp(T(cl_row_main[0]), "PCI 412  PCC") && !strcmp(T(cl_row_sub[1]), "n41 · ARFCN 504990") && !strcmp(T(cl_row_rsrp[1]), "-95 dBm") &&
           !strcmp(T(cl_row_rsrp[2]), "—"), "serving-cell candidates (%d): %s / %s", rows, T(cl_row_main[0]), T(cl_row_sub[1]));
-    CHECK(!strcmp(T(cl_pcc), "PCI 412 · 627264 · n78") && !strcmp(T(cl_tag), "NR") && strstr(T(cl_caption), "仅当前服务载波"), "pcc: %s", T(cl_pcc));
+    CHECK(!strcmp(T(cl_pcc), "PCI 412 · 627264 · n78") && !strcmp(T(cl_tag), "NR") && strstr(T(cl_caption), "服务载波") &&
+          strstr(T(cl_scan_cap), "扫描"), "pcc: %s / %s", T(cl_pcc), T(cl_caption));
     CHECK(!strcmp(T(cl_lock_cap), "先选择一个小区") && !(W(cl_lock)->flags & CLICKABLE), "lock disabled until a row is picked");
     CHECK(tap(301) && !strcmp(T(cl_lock_cap), "锁定 PCI 118") && (W(cl_lock)->flags & CLICKABLE) && W(cl_row[1])->bg[2] == 237, "row picked");
     CHECK(posts() == 0, "picking a row sends nothing");
@@ -613,6 +661,109 @@ int main(int argc, char **argv) {
     tap(301);
     ctl("/__radio", "{\"set\":{\"nrca\":\"\"}}"); refresh_dash(); render_all();
     CHECK(!tap(41) && lk_state == LS_IDLE && !strcmp(T(cl_lock_cap), "先选择一个小区"), "vanished selection -> no dialog");
+
+    /* ---------- neighbour scan (ubus test double; never a real ubus) ---------- */
+    {
+        /* cancel confirm -> zero scans */
+        world("sa"); goto_page(PG_CELL, 0); render_all();
+        test_scan_hook_reset();
+        CHECK(tap(42) && lk_state == LS_CONFIRM && !strcmp(T(dl_title), "扫描附近小区？") &&
+              strstr(T(dl_warn), "5G SA") && strstr(T(dl_details), "不用单独扫频段") &&
+              !strcmp(T(dl_ok_cap), "确认扫描") && W(dl_block)->x == PAGE_X(PG_CELL), "scan dialog: %s", T(dl_lead));
+        dump("d2-scan-confirm", PG_CELL, "锁小区 · 扫描确认");
+        CHECK(tap(50) && lk_state == LS_IDLE && hidden(dl_block) && test_scan_n == 0 && sc_calls == 0 && sc_state == SC_IDLE,
+              "cancel scan confirm -> zero scans (%d)", test_scan_n);
+        CHECK(posts() == 0, "cancel scan sends no lock POST");
+
+        /* confirm -> exactly one scan, results render with band/PCI/RSRP, serving marked */
+        world("sa"); goto_page(PG_CELL, 0); render_all();
+        test_scan_hook_reset(); ctl("/__clearlog", NULL);
+        CHECK(sc_go() && sc_state == SC_DONE && test_scan_n == 1 && test_get_lte_n >= 1 && test_get_nr_n >= 1 && sc_calls == 1,
+              "confirm runs exactly one scan (scan=%d lte=%d nr=%d calls=%d state=%d)", test_scan_n, test_get_lte_n, test_get_nr_n, sc_calls, sc_state);
+        /* serving (3) then scan results sorted stronger first: NR 412 -86, LTE 253 -75, LTE 252 -85 */
+        int vis = 0, s253 = -1, s412 = -1, s252 = -1;
+        for (int i = 0; i < CELL_ROWS; i++) if (!(W(cl_row[i])->flags & HIDDEN)) {
+            vis++;
+            if (strstr(T(cl_row_main[i]), "PCI 253")) s253 = i;
+            if (strstr(T(cl_row_main[i]), "PCI 412") && strstr(T(cl_row_main[i]), "NR")) s412 = i;
+            if (strstr(T(cl_row_main[i]), "PCI 252")) s252 = i;
+        }
+        CHECK(vis >= 6 && s253 > 2 && s412 > 2 && s252 > s253,
+              "scan rows after serving (%d) 253=%d 412=%d 252=%d", vis, s253, s412, s252);
+        CHECK(s253 >= 0 && strstr(T(cl_row_main[s253]), "LTE") && strstr(T(cl_row_sub[s253]), "B8") &&
+              strstr(T(cl_row_sub[s253]), "3500") && !strcmp(T(cl_row_rsrp[s253]), "-75 dBm") &&
+              strstr(T(cl_row_sub[s253]), "RSRQ") && strstr(T(cl_row_sub[s253]), "SINR"),
+              "LTE B8 PCI 253 rsrp: %s / %s", T(cl_row_main[s253]), T(cl_row_sub[s253]));
+        CHECK(s412 >= 0 && strstr(T(cl_row_main[s412]), "在用") && strstr(T(cl_row_sub[s412]), "n78"),
+              "serving cell marked in scan list: %s", T(cl_row_main[s412]));
+        CHECK(strstr(T(cl_caption), "扫描结果"), "caption after scan: %s", T(cl_caption));
+        /* sort: -75 before -85 (253 before 252). 412 is -86, after 252 */
+        CHECK(s253 < s252 && s252 < s412, "stronger first: 253(%d) 252(%d) 412(%d)", s253, s252, s412);
+        dump("d4-scan-results", PG_CELL, "锁小区 · 扫描结果");
+
+        /* select a scanned LTE cell and lock POST body */
+        CHECK(tap(300 + s253) && strstr(T(cl_lock_cap), "锁定 PCI 253"), "pick scanned 253: %s", T(cl_lock_cap));
+        CHECK(tap(41) && lk_state == LS_CONFIRM && strstr(T(dl_details), "PCI  253") && strstr(T(dl_details), "EARFCN  3500"),
+              "lock dialog from scan row: %s", T(dl_details));
+        tap(51); lock_step();
+        CHECK(strstr(mock_log(), "{\\\"lock_lte_pci\\\":\\\"253\\\",\\\"lock_lte_earfcn\\\":\\\"3500\\\"}") != NULL, "scan-row LTE lock body");
+        /* do not wait for verify here; dismiss by resetting world below */
+
+        /* empty result */
+        world("sa"); goto_page(PG_CELL, 0); render_all();
+        test_scan_hook_reset(); test_empty_both = 1;
+        CHECK(sc_go() && sc_state == SC_EMPTY && test_scan_n == 1 && strstr(T(cl_empty), "无附近小区") && !hidden(cl_empty),
+              "empty scan: %s state=%d", T(cl_empty), sc_state);
+        dump("d5-scan-empty", PG_CELL, "锁小区 · 无附近小区");
+
+        /* error */
+        world("sa"); goto_page(PG_CELL, 0); render_all();
+        test_scan_hook_reset(); test_fail_scan = 1;
+        CHECK(sc_go() && sc_state == SC_FAIL && test_scan_n == 1 && test_get_lte_n == 0 && test_get_nr_n == 0 &&
+              strstr(T(cl_empty), "失败") && sc_calls == 1, "scan error: %s (gets %d/%d)", T(cl_empty), test_get_lte_n, test_get_nr_n);
+
+        /* mutual exclusion vs lock and speed test */
+        world("sa"); goto_page(PG_CELL, 0); render_all();
+        test_scan_hook_reset();
+        CHECK(tap(42) && lk_state == LS_CONFIRM, "open scan confirm for exclusion");
+        goto_page(PG_OVERVIEW, 0); render_all();
+        CHECK(!tap(21) && st_state != SP_RUN, "测速 refused while scan confirm is open");
+        goto_page(PG_CELL, 0); render_all();
+        /* confirm starts SC_RUN; do not call scan_run yet */
+        CHECK(tap(51) && sc_state == SC_RUN && sc_req == 1 && hidden(dl_block), "scan running (not yet collected)");
+        render_all();
+        dump("d3-scan-running", PG_CELL, "锁小区 · 扫描中");
+        CHECK(strstr(T(cl_scan_cap), "扫描中") && !(W(cl_scan)->flags & CLICKABLE), "scan button disabled while running");
+        CHECK(!tap(42) && lk_state == LS_IDLE && test_scan_n == 0, "second scan refused while running (no ubus yet)");
+        CHECK(!tap(40) && !tap(41), "lock/reset refused while scanning");
+        goto_page(PG_OVERVIEW, 0); render_all();
+        CHECK(!tap(21) && st_state != SP_RUN && strstr(T(ov_st_btn_cap), "扫描中"), "测速 refused while scanning: %s", T(ov_st_btn_cap));
+        goto_page(PG_BAND, 0); render_all();
+        /* apply may be disabled / refused */
+        int apply_refused = !tap(33) || lk_state != LS_CONFIRM;
+        CHECK(apply_refused && lk_state != LS_CONFIRM, "band apply refused while scanning");
+        /* finish the pending scan once */
+        pthread_mutex_lock(&lock); sc_req = 0; pthread_mutex_unlock(&lock);
+        scan_run(); render_all();
+        CHECK(sc_state == SC_DONE && test_scan_n == 1, "pending scan completes once");
+
+        /* speed test running blocks a new scan */
+        world("sa"); goto_page(PG_OVERVIEW, 0); render_all();
+        test_scan_hook_reset();
+        pthread_mutex_lock(&lock); st_cool_until = 0; pthread_mutex_unlock(&lock);
+        CHECK(tap(21) && st_state == SP_RUN, "start 测速 to block scan");
+        goto_page(PG_CELL, 0); render_all();
+        CHECK(!tap(42) && lk_state == LS_IDLE && test_scan_n == 0 && sc_state == SC_IDLE, "scan refused during 测速");
+        pthread_mutex_lock(&lock); st_req = 0; st_state = SP_IDLE; st_cool_until = 0; pthread_mutex_unlock(&lock);
+        render_all();
+
+        /* opening the cell page does not start a scan */
+        world("sa"); test_scan_hook_reset();
+        goto_page(PG_CELL, 0); render_all();
+        CHECK(test_scan_n == 0 && sc_state == SC_IDLE && sc_calls == 0, "opening the page does not scan");
+
+        ubus_hook = NULL; scan_wait_hook = NULL;
+    }
 
     /* ---------- render cost: an unchanged view makes no LVGL calls ---------- */
     world("sa"); goto_page(PG_OVERVIEW, 0); render_all();

@@ -16,6 +16,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <strings.h>
+#include <ctype.h>
 #include <unistd.h>
 
 /* All launcher calls go through LV(): the b31 address is mapped to the running ABI.
@@ -56,8 +57,8 @@ enum { PG_OVERVIEW = 3, PG_PROXY = 4, PG_BAND = 5, PG_CELL = 6, PAGE_COUNT = 6 }
 #define BUDGET_OVERVIEW 48
 #define BAND_CHIPS 28
 #define BUDGET_BAND (BAND_CHIPS * 4 + 20)   /* 132 */
-#define CELL_ROWS 8
-#define BUDGET_CELL (CELL_ROWS * 4 + 16)    /* 48 */
+#define CELL_ROWS 20
+#define BUDGET_CELL (CELL_ROWS * 4 + 18)    /* 98: rows + chrome + 扫描 button */
 #define BUDGET_OVERLAY 24
 #define BUDGET_DOTS 4
 #define POOL_MAX (BUDGET_PROXY + BUDGET_OVERVIEW + BUDGET_BAND + BUDGET_CELL + BUDGET_OVERLAY + BUDGET_DOTS)
@@ -1452,7 +1453,7 @@ static void refresh_caps(void) {
  * Replies: 200 {"ok":true,"data":..}; 400/503 {"ok":false,"error":".."}; 401 unauthorized.
  * Safety: the only caller of lock_post() is lock_step(), which runs a snapshot only after the
  * confirm button consumed a matching token; a lock POST is never retried automatically. */
-enum { LK_NONE, LK_BAND_NR, LK_BAND_LTE, LK_BAND_RESET, LK_CELL_NR, LK_CELL_LTE, LK_CELL_RESET };
+enum { LK_NONE, LK_BAND_NR, LK_BAND_LTE, LK_BAND_RESET, LK_CELL_NR, LK_CELL_LTE, LK_CELL_RESET, LK_NBR_SCAN };
 enum { LS_IDLE, LS_CONFIRM, LS_SENDING, LS_VERIFY, LS_OK, LS_FAIL, LS_SENT };
 struct lockop { int kind, page, nb; int bands[MAX_LOCK_BANDS]; int pci, bandnum; long long arfcn; };
 static struct lockop lk_op;                /* frozen snapshot: what the dialog shows and the POST sends */
@@ -1557,7 +1558,7 @@ static int in_use_locked(int rat, int band) {
     return 0;
 }
 
-/* -- cell candidates: the serving carriers only (the agent has no neighbour-cell API) -- */
+/* -- cell candidates: current serving carriers (scan results are appended after a confirmed ubus scan) -- */
 struct cand { int rat, pci, bandnum, has_rsrp; long long arfcn; double rsrp; char label[8], band[12]; };
 static int candidates_locked(struct cand *out, int max) {
     int n = 0;
@@ -1580,6 +1581,302 @@ static int candidates_locked(struct cand *out, int max) {
 }
 static int cell_sel_rat, cell_sel_pci = -1;      /* selected candidate (UI, under lock) */
 static long long cell_sel_arfcn = -1;
+
+/* -- neighbour scan: firmware ubus (the deployed agent has no neighbour API) --
+ *   ubus call zte_nwinfo_api nwinfo_scan_nbr '{}'
+ *   ubus call zte_nwinfo_api nwinfo_get_lte_nbr_contents '{}'  -> lte_nbr_contents
+ *                                                              (fallback lte_neighbor_cell)
+ *   ubus call zte_nwinfo_api nwinfo_get_nr5g_nbr_contents '{}' -> nr5g_nbr_contents
+ *                                                              (fallback nr_neighbor_cell)
+ * Stock WebUI records: "PCI,ARFCN,band,RSRP[ ,RSRQ[,SINR]];…". Scan is disruptive
+ * (can briefly drop the WAN or fall from 5G SA to LTE) and is never retried automatically. */
+#define SCAN_MAX 16
+#define NBR_RAW_MAX 8192
+enum { SC_IDLE, SC_RUN, SC_DONE, SC_EMPTY, SC_FAIL };
+struct nbr {
+    int rat, pci, bandnum, has_rsrp, has_rsrq, has_sinr;
+    long long arfcn;
+    double rsrp, rsrq, sinr;
+    char band[12];
+};
+static int sc_state, sc_req, sc_n, sc_calls;
+static char sc_phase[64], sc_err[160];
+static struct nbr sc_list[SCAN_MAX];
+static pthread_cond_t sc_cond = PTHREAD_COND_INITIALIZER;
+#if defined(U60_FAKE_LVGL) || defined(U60_HOST_TEST)
+static int (*ubus_hook)(const char *svc, const char *method, const char *args, char *out, size_t outlen, int timeout_s);
+static void (*scan_wait_hook)(int ms);
+#endif
+static int scan_busy_locked(void) { return sc_state == SC_RUN; }
+
+static int ubus_call(const char *svc, const char *method, const char *args, char *out, size_t outlen, int timeout_s) {
+    if (out && outlen) out[0] = 0;
+    if (!svc || !method || !out || outlen < 2) return -1;
+#if defined(U60_FAKE_LVGL) || defined(U60_HOST_TEST)
+    if (ubus_hook) return ubus_hook(svc, method, args, out, outlen, timeout_s);
+    return -1;                                            /* tests never call a real ubus */
+#else
+    char cmd[384];
+    const char *a = (args && *args) ? args : "{}";
+    if (snprintf(cmd, sizeof cmd, "ubus -t %d call %s %s '%s' 2>/dev/null", timeout_s, svc, method, a) >= (int)sizeof cmd) return -1;
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return -1;
+    size_t n = fread(out, 1, outlen - 1, fp);
+    out[n] = 0;
+    int st = pclose(fp);
+    return (st == 0 && n > 0) ? 0 : -1;
+#endif
+}
+static void scan_wait_ms(int ms) {
+    if (ms <= 0) return;
+#if defined(U60_FAKE_LVGL) || defined(U60_HOST_TEST)
+    if (scan_wait_hook) scan_wait_hook(ms);
+    return;
+#else
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000L;
+    while (nanosleep(&ts, &ts) && errno == EINTR) {}
+#endif
+}
+
+static int nbr_bandnum(const char *s) {
+    if (!s) return 0;
+    while (*s == ' ' || *s == '\t') s++;
+    if (!strncasecmp(s, "LTE BAND ", 9)) s += 9;
+    else if (!strncasecmp(s, "NR BAND ", 8)) s += 8;
+    else if (!strncasecmp(s, "LTE ", 4)) s += 4;
+    else if (!strncasecmp(s, "NR ", 3)) s += 3;
+    if (*s == 'n' || *s == 'N' || *s == 'b' || *s == 'B') s++;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s < '1' || *s > '9') return 0;
+    int v = 0;
+    while (*s >= '0' && *s <= '9') { if (v > 1024) return 0; v = v * 10 + (*s - '0'); s++; }
+    return (v >= 1 && v <= 1024) ? v : 0;
+}
+static void nbr_band_text(int rat, int num, const char *raw, char *out, size_t n) {
+    if (num > 0) snprintf(out, n, rat == RAT_NR ? "n%d" : "B%d", num);
+    else if (raw && *raw) snprintf(out, n, "%s", raw);
+    else snprintf(out, n, "—");
+}
+static int nbr_num(const char *s, double *out) {
+    if (!s) return -1;
+    while (*s == ' ' || *s == '\t') s++;
+    if (!*s) return -1;
+    return numeric_text(s, strlen(s), out);
+}
+static int nbr_push(struct nbr *out, int max, int n, int rat, int pci, long long arfcn, int bandnum, const char *bandraw,
+                    int has_rsrp, double rsrp, int has_rsrq, double rsrq, int has_sinr, double sinr) {
+    if (n >= max || pci < 0) return n;
+    for (int i = 0; i < n; i++) if (out[i].rat == rat && out[i].pci == pci && out[i].arfcn == arfcn) return n;
+    struct nbr *c = &out[n];
+    memset(c, 0, sizeof *c);
+    c->rat = rat; c->pci = pci; c->arfcn = arfcn; c->bandnum = bandnum;
+    c->has_rsrp = has_rsrp; c->rsrp = rsrp; c->has_rsrq = has_rsrq; c->rsrq = rsrq; c->has_sinr = has_sinr; c->sinr = sinr;
+    nbr_band_text(rat, bandnum, bandraw, c->band, sizeof c->band);
+    return n + 1;
+}
+/* Stock record string: PCI,ARFCN,band,RSRP[,RSRQ[,SINR]];… */
+static int parse_nbr_records(int rat, const char *raw, struct nbr *out, int max, int n) {
+    if (!raw) return n;
+    const char *p = raw;
+    while (*p && n < max) {
+        while (*p == ' ' || *p == ';' || *p == '\n' || *p == '\r' || *p == '\t') p++;
+        if (!*p) break;
+        const char *end = p;
+        while (*end && *end != ';') end++;
+        char f[6][24];
+        int nf = split_fields(p, (size_t)(end - p), f, 6);
+        p = *end ? end + 1 : end;
+        if (nf < 1 || !f[0][0]) continue;
+        double pci_d, arfcn_d, rsrp = 0, rsrq = 0, sinr = 0;
+        if (nbr_num(f[0], &pci_d) || pci_d < 0 || pci_d > 1007 || pci_d != (double)(int)pci_d) continue;
+        long long arfcn = 0;
+        if (nf > 1 && f[1][0] && !nbr_num(f[1], &arfcn_d) && arfcn_d >= 0 && arfcn_d == (double)(long long)arfcn_d) arfcn = (long long)arfcn_d;
+        int bandnum = nf > 2 ? nbr_bandnum(f[2]) : 0;
+        int has_rsrp = nf > 3 && f[3][0] && !nbr_num(f[3], &rsrp);
+        int has_rsrq = nf > 4 && f[4][0] && !nbr_num(f[4], &rsrq);
+        int has_sinr = nf > 5 && f[5][0] && !nbr_num(f[5], &sinr);
+        n = nbr_push(out, max, n, rat, (int)pci_d, arfcn, bandnum, nf > 2 ? f[2] : "", has_rsrp, rsrp, has_rsrq, rsrq, has_sinr, sinr);
+    }
+    return n;
+}
+static int parse_nbr_array(int rat, const char *arr, struct nbr *out, int max, int n) {
+    arr = jws(arr);
+    if (!arr || *arr != '[') return n;
+    const char *p = jws(arr + 1);
+    while (p && *p && *p != ']' && n < max) {
+        if (*p == '{') {
+            char pci_s[24] = "", arfcn_s[24] = "", band_s[24] = "", rsrp_s[24] = "", rsrq_s[24] = "", sinr_s[24] = "";
+            const char *v;
+            if ((v = jget(p, "pci"))) { if (*v == '"') jstr(v, pci_s, sizeof pci_s); else { size_t k = 0; while (v[k] && k + 1 < sizeof pci_s && ((v[k] >= '0' && v[k] <= '9') || v[k] == '-' || v[k] == '+')) { pci_s[k] = v[k]; k++; } pci_s[k] = 0; } }
+            if ((v = jget(p, rat == RAT_NR ? "nrarfcn" : "earfcn")) || (v = jget(p, "earfcn")) || (v = jget(p, "nrarfcn")) || (v = jget(p, "arfcn"))) {
+                if (*v == '"') jstr(v, arfcn_s, sizeof arfcn_s); else { size_t k = 0; while (v[k] && k + 1 < sizeof arfcn_s && ((v[k] >= '0' && v[k] <= '9') || v[k] == '-' || v[k] == '+')) { arfcn_s[k] = v[k]; k++; } arfcn_s[k] = 0; }
+            }
+            if ((v = jget(p, "band"))) { if (*v == '"') jstr(v, band_s, sizeof band_s); else { size_t k = 0; while (v[k] && k + 1 < sizeof band_s && !strchr(",}] \t\n", v[k])) { band_s[k] = v[k]; k++; } band_s[k] = 0; } }
+            if ((v = jget(p, "rsrp"))) { if (*v == '"') jstr(v, rsrp_s, sizeof rsrp_s); else { size_t k = 0; while (v[k] && k + 1 < sizeof rsrp_s && (isdigit((unsigned char)v[k]) || v[k] == '-' || v[k] == '+' || v[k] == '.')) { rsrp_s[k] = v[k]; k++; } rsrp_s[k] = 0; } }
+            if ((v = jget(p, "rsrq"))) { if (*v == '"') jstr(v, rsrq_s, sizeof rsrq_s); else { size_t k = 0; while (v[k] && k + 1 < sizeof rsrq_s && (isdigit((unsigned char)v[k]) || v[k] == '-' || v[k] == '+' || v[k] == '.')) { rsrq_s[k] = v[k]; k++; } rsrq_s[k] = 0; } }
+            if ((v = jget(p, "sinr"))) { if (*v == '"') jstr(v, sinr_s, sizeof sinr_s); else { size_t k = 0; while (v[k] && k + 1 < sizeof sinr_s && (isdigit((unsigned char)v[k]) || v[k] == '-' || v[k] == '+' || v[k] == '.')) { sinr_s[k] = v[k]; k++; } sinr_s[k] = 0; } }
+            double pci_d, arfcn_d, rsrp = 0, rsrq = 0, sinr = 0;
+            if (!nbr_num(pci_s, &pci_d) && pci_d >= 0 && pci_d <= 1007 && pci_d == (double)(int)pci_d) {
+                long long arfcn = 0;
+                if (arfcn_s[0] && !nbr_num(arfcn_s, &arfcn_d) && arfcn_d >= 0) arfcn = (long long)arfcn_d;
+                int has_rsrp = rsrp_s[0] && !nbr_num(rsrp_s, &rsrp);
+                int has_rsrq = rsrq_s[0] && !nbr_num(rsrq_s, &rsrq);
+                int has_sinr = sinr_s[0] && !nbr_num(sinr_s, &sinr);
+                n = nbr_push(out, max, n, rat, (int)pci_d, arfcn, nbr_bandnum(band_s), band_s, has_rsrp, rsrp, has_rsrq, rsrq, has_sinr, sinr);
+            }
+            p = jskip(p);
+        } else p = jskip(p);
+        if (!p) break;
+        p = jws(p);
+        if (p && *p == ',') p = jws(p + 1);
+    }
+    return n;
+}
+static int extract_nbr_blob(const char *json, int is_nr, char *out, size_t n) {
+    if (out && n) out[0] = 0;
+    if (!json) return -1;
+    const char *keys[2];
+    keys[0] = is_nr ? "nr5g_nbr_contents" : "lte_nbr_contents";
+    keys[1] = is_nr ? "nr_neighbor_cell" : "lte_neighbor_cell";
+    for (int i = 0; i < 2; i++) {
+        const char *v = jget(json, keys[i]);
+        if (!v) continue;
+        if (*v == '"') return jstr(v, out, n);
+        if (*v == '[') {                          /* keep the array text for parse_nbr_array */
+            const char *end = jskip(v);
+            if (!end || end <= v) continue;
+            size_t len = (size_t)(end - v);
+            if (len >= n) len = n - 1;
+            memcpy(out, v, len); out[len] = 0;
+            return 0;
+        }
+    }
+    return -1;
+}
+static int parse_nbr_blob(int rat, const char *blob, struct nbr *out, int max, int n) {
+    if (!blob || !blob[0]) return n;
+    const char *p = jws(blob);
+    if (p && *p == '[') return parse_nbr_array(rat, p, out, max, n);
+    return parse_nbr_records(rat, blob, out, max, n);
+}
+static int nbr_cmp(const void *a, const void *b) {
+    const struct nbr *x = a, *y = b;
+    if (x->has_rsrp != y->has_rsrp) return y->has_rsrp - x->has_rsrp;
+    if (x->has_rsrp && x->rsrp != y->rsrp) return x->rsrp > y->rsrp ? -1 : 1;
+    if (x->rat != y->rat) return x->rat == RAT_NR ? -1 : 1;
+    if (x->pci != y->pci) return x->pci - y->pci;
+    if (x->arfcn < y->arfcn) return -1;
+    if (x->arfcn > y->arfcn) return 1;
+    return 0;
+}
+static int nbr_fetch(int rat, struct nbr *out, int max, int n) {
+    char resp[NBR_RAW_MAX], blob[NBR_RAW_MAX];
+    const char *method = rat == RAT_NR ? "nwinfo_get_nr5g_nbr_contents" : "nwinfo_get_lte_nbr_contents";
+    if (ubus_call("zte_nwinfo_api", method, "{}", resp, sizeof resp, 5)) return n;
+    if (extract_nbr_blob(resp, rat == RAT_NR, blob, sizeof blob)) return n;
+    return parse_nbr_blob(rat, blob, out, max, n);
+}
+/* Worker / tests: run exactly one scan. sc_req must already have been consumed. */
+static void scan_run(void) {
+    char resp[512];
+    struct nbr got[SCAN_MAX];
+    int n = 0;
+    pthread_mutex_lock(&lock);
+    sc_calls++;
+    snprintf(sc_phase, sizeof sc_phase, "正在扫描附近小区…");
+    sc_n = 0; sc_err[0] = 0;
+    generation++;
+    pthread_mutex_unlock(&lock);
+
+    int rc = ubus_call("zte_nwinfo_api", "nwinfo_scan_nbr", "{}", resp, sizeof resp, 25);
+    if (rc) {
+        pthread_mutex_lock(&lock);
+        sc_state = SC_FAIL;
+        snprintf(sc_err, sizeof sc_err, "扫描失败（ubus 无响应）");
+        sc_phase[0] = 0;
+        generation++;
+        pthread_mutex_unlock(&lock);
+        return;
+    }
+    pthread_mutex_lock(&lock);
+    snprintf(sc_phase, sizeof sc_phase, "正在读取邻区列表…");
+    generation++;
+    pthread_mutex_unlock(&lock);
+
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (attempt) scan_wait_ms(3000);          /* poll contents only; the scan itself is never retried */
+        n = 0;
+        n = nbr_fetch(RAT_NR, got, SCAN_MAX, n);
+        n = nbr_fetch(RAT_LTE, got, SCAN_MAX, n);
+        if (n > 0) break;
+    }
+    if (n > 1) qsort(got, (size_t)n, sizeof got[0], nbr_cmp);
+
+    pthread_mutex_lock(&lock);
+    sc_n = n < SCAN_MAX ? n : SCAN_MAX;
+    memcpy(sc_list, got, sizeof(struct nbr) * (size_t)sc_n);
+    if (n > 0) { sc_state = SC_DONE; sc_err[0] = 0; }
+    else { sc_state = SC_EMPTY; sc_err[0] = 0; }
+    sc_phase[0] = 0;
+    generation++;
+    pthread_mutex_unlock(&lock);
+}
+static void sc_start_locked(void) {
+    sc_state = SC_RUN;
+    sc_req = 1;
+    sc_n = 0;
+    sc_err[0] = 0;
+    snprintf(sc_phase, sizeof sc_phase, "正在扫描附近小区…");
+    generation++;
+    wake_flag = 1;
+    pthread_cond_signal(&wake_cond);
+    pthread_cond_signal(&sc_cond);
+}
+static void *scan_thread(void *unused) {
+    (void)unused;
+    for (;;) {
+        pthread_mutex_lock(&lock);
+        while (!sc_req) pthread_cond_wait(&sc_cond, &lock);
+        sc_req = 0;
+        pthread_mutex_unlock(&lock);
+        scan_run();
+    }
+    return NULL;
+}
+static int nbr_is_serving_locked(const struct nbr *c, char *label, size_t llen) {
+    if (label && llen) label[0] = 0;
+    if (!dash.ok) return 0;
+    const struct carrier *cs = c->rat == RAT_NR ? dash.nr : dash.lte;
+    int cn = c->rat == RAT_NR ? dash.nnr : dash.nlte;
+    for (int i = 0; i < cn; i++) {
+        int same = cs[i].pci == c->pci && ((c->arfcn > 0 && cs[i].arfcn == c->arfcn) || (c->arfcn <= 0 && c->bandnum > 0 && cs[i].bandnum == c->bandnum));
+        if (!same) continue;
+        if (label) snprintf(label, llen, "在用 %s", cs[i].label);
+        return 1;
+    }
+    return 0;
+}
+static int find_selected_cell(struct cand *out) {
+    struct cand s[CELL_ROWS];
+    int ns = candidates_locked(s, CELL_ROWS);
+    for (int i = 0; i < ns; i++) {
+        if (s[i].rat == cell_sel_rat && s[i].pci == cell_sel_pci && s[i].arfcn == cell_sel_arfcn) { *out = s[i]; return 1; }
+    }
+    for (int i = 0; i < sc_n; i++) {
+        const struct nbr *c = &sc_list[i];
+        if (c->rat != cell_sel_rat || c->pci != cell_sel_pci || c->arfcn != cell_sel_arfcn) continue;
+        if (c->pci < 0 || c->arfcn <= 0 || (c->rat == RAT_NR && c->bandnum <= 0)) return 0;
+        memset(out, 0, sizeof *out);
+        out->rat = c->rat; out->pci = c->pci; out->bandnum = c->bandnum; out->arfcn = c->arfcn;
+        out->has_rsrp = c->has_rsrp; out->rsrp = c->rsrp;
+        snprintf(out->band, sizeof out->band, "%s", c->band);
+        return 1;
+    }
+    return 0;
+}
+
 
 /* "n41, n28 等 20 个" / "n1, n3" / "无": supported bands the lock leaves out, serving ones first */
 static void exclusion_text_locked(int rat, const int *keep, int nk, char *out, size_t len) {
@@ -1648,6 +1945,15 @@ static void build_dialog_locked(const struct lockop *op) {
         snprintf(dlg_recovery, sizeof dlg_recovery, "恢复方法：回到「锁小区」页点「解除锁定」。");
         break;
     }
+    case LK_NBR_SCAN:
+        snprintf(dlg_title, sizeof dlg_title, "扫描附近小区？");
+        snprintf(dlg_lead, sizeof dlg_lead, "将列出附近小区的频段、PCI 和信号强度。");
+        snprintf(dlg_details, sizeof dlg_details, "操作  扫描附近小区\n范围  LTE 与 NR 邻区\n说明  不用单独扫频段，结果里已带频段和强度");
+        snprintf(dlg_warn, sizeof dlg_warn, "！可能短暂断网或从 5G SA 掉回 LTE");
+        dlg_warn_bad = 1;
+        snprintf(dlg_cons, sizeof dlg_cons, "扫描会让调制解调器搜邻区，移动上网可能短暂断开，或从 5G SA 掉到 LTE。只会扫描一次，不会自动重试。");
+        snprintf(dlg_recovery, sizeof dlg_recovery, "扫描结束后网络通常会自行恢复；若仍异常，可在「锁频」页点「恢复自动」。");
+        break;
     case LK_CELL_RESET:
         snprintf(dlg_title, sizeof dlg_title, "解除小区锁定？");
         snprintf(dlg_lead, sizeof dlg_lead, "将清除小区锁定，回到自动选择。");
@@ -1659,7 +1965,7 @@ static void build_dialog_locked(const struct lockop *op) {
 }
 /* UI thread, lock held. Opens the dialog with a frozen snapshot. Refused while any op runs. */
 static int lock_open_locked(const struct lockop *op) {
-    if (busy_op != OP_NONE || lock_busy_locked() || op->kind == LK_NONE || st_state == SP_RUN) return 0;
+    if (busy_op != OP_NONE || lock_busy_locked() || op->kind == LK_NONE || st_state == SP_RUN || scan_busy_locked()) return 0;
     if ((op->kind == LK_BAND_NR || op->kind == LK_BAND_LTE) && op->nb <= 0) return 0;
     if ((op->kind == LK_CELL_NR || op->kind == LK_CELL_LTE) && (op->pci < 0 || op->arfcn <= 0)) return 0;
     lk_op = *op;
@@ -1680,6 +1986,13 @@ static int lock_cancel_locked(void) {
 /* The ONLY way to arm a POST: the confirm button while the dialog is open. Idempotent. */
 static int lock_confirm_locked(void) {
     if (lk_state != LS_CONFIRM || busy_op != OP_NONE) return 0;
+    if (lk_op.kind == LK_NBR_SCAN) {                    /* confirm starts exactly one scan; no POST, no retry */
+        if (scan_busy_locked() || st_state == SP_RUN) return 0;
+        lk_confirmed = 0;
+        lk_state = LS_IDLE;
+        sc_start_locked();
+        return 1;
+    }
     lk_confirmed = lk_token;
     lk_state = LS_SENDING;
     lk_state_at = now_ms();
@@ -1774,6 +2087,7 @@ static int lock_step(void) {
     if (go) { op = lk_op; lk_confirmed = 0; }       /* consumed: one POST per confirm tap */
     pthread_mutex_unlock(&lock);
     if (!go) return 0;
+    if (op.kind == LK_NBR_SCAN) return 0;               /* scans never go through lock_post */
     char path[48], body[320], reason[256] = "";
     lock_request(&op, path, sizeof path, body, sizeof body);
     int r = path[0] ? lock_post(path, body[0] ? body : "", reason, sizeof reason) : PR_REJECTED;
@@ -2454,7 +2768,7 @@ static void *speed_thread(void *unused) {
 /* UI thread, lock held: tap on 测速 / 停止 */
 static int st_tap_locked(void) {
     if (st_state == SP_RUN) { if (st_cancel) return 0; st_cancel = 1; generation++; return 1; }
-    if (now_ms() < st_cool_until || lock_busy_locked()) return 0;
+    if (now_ms() < st_cool_until || lock_busy_locked() || scan_busy_locked()) return 0;
     st_state = SP_RUN; st_req = 1; st_cancel = 0;
     snprintf(st_phase, sizeof st_phase, "准备中…");
     st_bytes = 0; st_elapsed = 0; st_live = 0; st_ping = -1; st_err[0] = 0;
@@ -2520,6 +2834,7 @@ static void st_view_locked(struct ov_view *v) {
         }
         if (r && st_state != SP_FAIL) snprintf(v->st_note, sizeof v->st_note, "每次约消耗几十 MB 流量 · 上次 %.1f MB", (double)r->bytes / 1e6);
         if (t < st_cool_until) { v->st_btn_style = 0; snprintf(v->st_btn, sizeof v->st_btn, "%d 秒后可测", (int)((st_cool_until - t + 999) / 1000)); }
+        else if (scan_busy_locked()) { v->st_btn_style = 0; snprintf(v->st_btn, sizeof v->st_btn, "扫描中"); }
         else if (lock_busy_locked()) { v->st_btn_style = 0; snprintf(v->st_btn, sizeof v->st_btn, "锁频中"); }
     }
 }
@@ -2589,7 +2904,7 @@ static void build_band(struct band_view *v) {
     memset(v, 0, sizeof *v);
     pthread_mutex_lock(&lock);
     int64_t t = now_ms();
-    int busy = lock_busy_locked() || busy_op != OP_NONE;
+    int busy = lock_busy_locked() || busy_op != OP_NONE || scan_busy_locked();
     int rat = v->tab = band_tab;
     int mine = lock_is_band(lk_op.kind);
     if (rat == 0 && dash.ok && dash.mode == NM_NSA && !caps_nsa_supported) {
@@ -2661,18 +2976,19 @@ static void build_band(struct band_view *v) {
 struct cell_view {
     char tag[8]; int tag_tone;
     char pcc_title[48], pcc[96], lockline[128], caption[96];
-    int nrows;
+    int nrows, empty_y;
     char row_main[CELL_ROWS][48], row_sub[CELL_ROWS][64], row_rsrp[CELL_ROWS][24];
-    unsigned char row_tone[CELL_ROWS], row_sel[CELL_ROWS], row_ok[CELL_ROWS];
+    unsigned char row_tone[CELL_ROWS], row_sel[CELL_ROWS], row_ok[CELL_ROWS], row_scan[CELL_ROWS];
     int row_rat[CELL_ROWS], row_pci[CELL_ROWS], row_band[CELL_ROWS]; long long row_arfcn[CELL_ROWS];
-    char empty[64];
+    char empty[80];
     char reset_text[24]; int reset_enabled;
     char lock_text[40]; int lock_style;                          /* 0 disabled, 1 primary, 2 retry */
+    char scan_text[24]; int scan_style;                          /* 0 disabled, 1/3 ready, running */
 };
 static void build_cell(struct cell_view *v) {
     memset(v, 0, sizeof *v);
     pthread_mutex_lock(&lock);
-    int busy = lock_busy_locked() || busy_op != OP_NONE;
+    int busy = lock_busy_locked() || busy_op != OP_NONE || scan_busy_locked();
     int mine = lk_op.kind == LK_CELL_NR || lk_op.kind == LK_CELL_LTE || lk_op.kind == LK_CELL_RESET;
     const struct carrier *p = primary_locked();
     snprintf(v->tag, sizeof v->tag, "%s", p ? (dash.prim == RAT_NR ? "NR" : "LTE") : "—");
@@ -2681,24 +2997,57 @@ static void build_cell(struct cell_view *v) {
     if (p) { char pci[8]; pci_text(p->pci, pci, sizeof pci); snprintf(v->pcc, sizeof v->pcc, "PCI %s · %lld · %s", pci, p->arfcn, p->band); }
     else snprintf(v->pcc, sizeof v->pcc, "%s", dash.ok ? "没有服务小区" : "—");
     snprintf(v->lockline, sizeof v->lockline, "锁定状态 agent 不提供 · 本屏上次请求 %s", cell_last_req[0] ? cell_last_req : "无");
-    snprintf(v->caption, sizeof v->caption, "候选小区 · 仅当前服务载波（agent 无邻区接口）");
+    if (sc_state == SC_RUN) snprintf(v->caption, sizeof v->caption, "%s", sc_phase[0] ? sc_phase : "正在扫描附近小区…");
+    else if (sc_state == SC_DONE) snprintf(v->caption, sizeof v->caption, "服务载波 + 扫描结果 · 按信号从强到弱");
+    else if (sc_state == SC_EMPTY) snprintf(v->caption, sizeof v->caption, "服务载波 · 扫描未发现附近小区");
+    else if (sc_state == SC_FAIL) snprintf(v->caption, sizeof v->caption, "服务载波 · 扫描失败");
+    else snprintf(v->caption, sizeof v->caption, "服务载波 · 可扫描附近小区");
     struct cand c[CELL_ROWS];
-    v->nrows = candidates_locked(c, CELL_ROWS);
-    for (int i = 0; i < v->nrows; i++) {
+    int ns = candidates_locked(c, CELL_ROWS);
+    v->nrows = 0;
+    for (int i = 0; i < ns && v->nrows < CELL_ROWS; i++) {
+        int k = v->nrows++;
         char pci[8];
         pci_text(c[i].pci, pci, sizeof pci);
-        snprintf(v->row_main[i], sizeof v->row_main[i], "PCI %s  %s", pci, c[i].label);
-        snprintf(v->row_sub[i], sizeof v->row_sub[i], "%s · ARFCN %lld", c[i].band, c[i].arfcn);
-        if (c[i].has_rsrp) { fmt_val(c[i].rsrp, "dBm", v->row_rsrp[i], sizeof v->row_rsrp[i]); v->row_tone[i] = (unsigned char)level_tone(rsrp_level(c[i].rsrp)); }
-        else { snprintf(v->row_rsrp[i], sizeof v->row_rsrp[i], "—"); v->row_tone[i] = T_DIM; }
-        v->row_rat[i] = c[i].rat; v->row_pci[i] = c[i].pci; v->row_arfcn[i] = c[i].arfcn; v->row_band[i] = c[i].bandnum;
-        v->row_ok[i] = (unsigned char)(c[i].pci >= 0 && c[i].arfcn > 0 && (c[i].rat == RAT_LTE || c[i].bandnum > 0));
-        v->row_sel[i] = (unsigned char)(c[i].rat == cell_sel_rat && c[i].pci == cell_sel_pci && c[i].arfcn == cell_sel_arfcn);
+        snprintf(v->row_main[k], sizeof v->row_main[k], "PCI %s  %s", pci, c[i].label);
+        snprintf(v->row_sub[k], sizeof v->row_sub[k], "%s · ARFCN %lld", c[i].band, c[i].arfcn);
+        if (c[i].has_rsrp) { fmt_val(c[i].rsrp, "dBm", v->row_rsrp[k], sizeof v->row_rsrp[k]); v->row_tone[k] = (unsigned char)level_tone(rsrp_level(c[i].rsrp)); }
+        else { snprintf(v->row_rsrp[k], sizeof v->row_rsrp[k], "—"); v->row_tone[k] = T_DIM; }
+        v->row_rat[k] = c[i].rat; v->row_pci[k] = c[i].pci; v->row_arfcn[k] = c[i].arfcn; v->row_band[k] = c[i].bandnum;
+        v->row_ok[k] = (unsigned char)(c[i].pci >= 0 && c[i].arfcn > 0 && (c[i].rat == RAT_LTE || c[i].bandnum > 0));
+        v->row_sel[k] = (unsigned char)(c[i].rat == cell_sel_rat && c[i].pci == cell_sel_pci && c[i].arfcn == cell_sel_arfcn);
+        v->row_scan[k] = 0;
     }
-    if (!dash.ok) snprintf(v->empty, sizeof v->empty, "%s", dash_err ? "读不到小区信息（agent 无响应）" : "正在读取…");
+    if (sc_state == SC_DONE) {
+        for (int i = 0; i < sc_n && v->nrows < CELL_ROWS; i++) {
+            const struct nbr *nb = &sc_list[i];
+            int k = v->nrows++;
+            char pci[8], mark[16] = "", extra[48] = "";
+            pci_text(nb->pci, pci, sizeof pci);
+            nbr_is_serving_locked(nb, mark, sizeof mark);
+            snprintf(v->row_main[k], sizeof v->row_main[k], "PCI %s  %s%s%s", pci, nb->rat == RAT_NR ? "NR" : "LTE", mark[0] ? " · " : "", mark);
+            if (nb->has_rsrq && nb->has_sinr) snprintf(extra, sizeof extra, " · RSRQ %.0f · SINR %.0f", nb->rsrq, nb->sinr);
+            else if (nb->has_sinr) snprintf(extra, sizeof extra, " · SINR %.0f dB", nb->sinr);
+            else if (nb->has_rsrq) snprintf(extra, sizeof extra, " · RSRQ %.0f dB", nb->rsrq);
+            snprintf(v->row_sub[k], sizeof v->row_sub[k], "%s · %s %lld%s", nb->band, nb->rat == RAT_NR ? "ARFCN" : "EARFCN", nb->arfcn, extra);
+            if (nb->has_rsrp) { fmt_val(nb->rsrp, "dBm", v->row_rsrp[k], sizeof v->row_rsrp[k]); v->row_tone[k] = (unsigned char)level_tone(rsrp_level(nb->rsrp)); }
+            else { snprintf(v->row_rsrp[k], sizeof v->row_rsrp[k], "—"); v->row_tone[k] = T_DIM; }
+            v->row_rat[k] = nb->rat; v->row_pci[k] = nb->pci; v->row_arfcn[k] = nb->arfcn; v->row_band[k] = nb->bandnum;
+            v->row_ok[k] = (unsigned char)(nb->pci >= 0 && nb->arfcn > 0 && (nb->rat == RAT_LTE || nb->bandnum > 0));
+            v->row_sel[k] = (unsigned char)(nb->rat == cell_sel_rat && nb->pci == cell_sel_pci && nb->arfcn == cell_sel_arfcn);
+            v->row_scan[k] = 1;
+        }
+    }
+    v->empty_y = 6 + (v->nrows ? v->nrows * 56 : 0);
+    if (sc_state == SC_RUN) snprintf(v->empty, sizeof v->empty, "%s", sc_phase[0] ? sc_phase : "正在扫描附近小区…");
+    else if (sc_state == SC_EMPTY) snprintf(v->empty, sizeof v->empty, "无附近小区");
+    else if (sc_state == SC_FAIL) snprintf(v->empty, sizeof v->empty, "%s", sc_err[0] ? sc_err : "扫描失败");
+    else if (!dash.ok) snprintf(v->empty, sizeof v->empty, "%s", dash_err ? "读不到小区信息（agent 无响应）" : "正在读取…");
     else if (!v->nrows) snprintf(v->empty, sizeof v->empty, "没有服务小区");
     snprintf(v->reset_text, sizeof v->reset_text, "解除锁定");
     v->reset_enabled = !busy;
+    snprintf(v->scan_text, sizeof v->scan_text, sc_state == SC_RUN ? "扫描中" : "扫描");
+    v->scan_style = busy ? 0 : 3;
     int sel = -1;
     for (int i = 0; i < v->nrows; i++) if (v->row_sel[i] && v->row_ok[i]) sel = i;
     int sel_kind = sel >= 0 ? (v->row_rat[sel] == RAT_NR ? LK_CELL_NR : LK_CELL_LTE) : LK_NONE;
@@ -2716,7 +3065,7 @@ static void build_cell(struct cell_view *v) {
 
 struct overlay_view {
     int confirm, confirm_page;
-    char title[64], lead[128], details[320], cons[400], recovery[160], warn[96];
+    char title[64], lead[128], details[320], cons[400], recovery[160], warn[96], ok_cap[24];
     int warn_bad;
     int result, result_page, result_tone, dismiss;
     char rtitle[64], rbody[640];
@@ -2735,6 +3084,7 @@ static void build_overlay(struct overlay_view *v) {
         snprintf(v->recovery, sizeof v->recovery, "%s", dlg_recovery);
         snprintf(v->warn, sizeof v->warn, "%s", dlg_warn);
         v->warn_bad = dlg_warn_bad;
+        snprintf(v->ok_cap, sizeof v->ok_cap, "%s", lk_op.kind == LK_NBR_SCAN ? "确认扫描" : "确认下发");
     }
     int cell = lk_op.kind == LK_CELL_NR || lk_op.kind == LK_CELL_LTE;
     switch (lk_state) {
@@ -2778,7 +3128,7 @@ static int ui_tap(int id) {
     if (id == 20) { goto_page(PG_PROXY, 1); return 1; }
     if (id == 21) { pthread_mutex_lock(&lock); int r = st_tap_locked(); pthread_mutex_unlock(&lock); return r; }
     pthread_mutex_lock(&lock);
-    int busy = lock_busy_locked() || busy_op != OP_NONE;
+    int busy = lock_busy_locked() || busy_op != OP_NONE || scan_busy_locked();
     if (id == 30 || id == 31) { if (band_tab != id - 30) { band_tab = id - 30; generation++; changed = 1; } }
     else if (id >= 200 && id < 200 + BAND_CHIPS) {
         int b = chip_band_shown[id - 200];
@@ -2805,20 +3155,21 @@ static int ui_tap(int id) {
             generation++;
             changed = 1;
         }
+    } else if (id == 42) {
+        struct lockop op = {0};
+        op.kind = LK_NBR_SCAN;
+        op.page = PG_CELL;
+        changed = lock_open_locked(&op);
     } else if (id == 41) {
-        struct cand c[CELL_ROWS];
-        int n = candidates_locked(c, CELL_ROWS);              /* the selection must still be a serving cell */
-        for (int i = 0; i < n; i++) {
-            if (c[i].rat != cell_sel_rat || c[i].pci != cell_sel_pci || c[i].arfcn != cell_sel_arfcn) continue;
-            if (c[i].rat == RAT_NR && c[i].bandnum <= 0) break;
+        struct cand c;
+        if (find_selected_cell(&c)) {                        /* serving or a scanned row still in the list */
             struct lockop op = {0};
-            op.kind = c[i].rat == RAT_NR ? LK_CELL_NR : LK_CELL_LTE;
+            op.kind = c.rat == RAT_NR ? LK_CELL_NR : LK_CELL_LTE;
             op.page = PG_CELL;
-            op.pci = c[i].pci;
-            op.arfcn = c[i].arfcn;
-            op.bandnum = c[i].bandnum;
+            op.pci = c.pci;
+            op.arfcn = c.arfcn;
+            op.bandnum = c.bandnum;
             changed = lock_open_locked(&op);
-            break;
         }
     } else if (id == 50) changed = lock_cancel_locked();
     else if (id == 51) changed = lock_confirm_locked();
@@ -2836,7 +3187,7 @@ static void *bd_chip[BAND_CHIPS], *bd_chip_cap[BAND_CHIPS], *bd_chip_dot[BAND_CH
 static void *bd_reset, *bd_reset_cap, *bd_apply, *bd_apply_cap;
 static void *cl_page, *cl_tag, *cl_pcc_title, *cl_pcc, *cl_lockline, *cl_caption, *cl_empty;
 static void *cl_row[CELL_ROWS], *cl_row_main[CELL_ROWS], *cl_row_sub[CELL_ROWS], *cl_row_rsrp[CELL_ROWS];
-static void *cl_reset, *cl_reset_cap, *cl_lock, *cl_lock_cap;
+static void *cl_reset, *cl_reset_cap, *cl_lock, *cl_lock_cap, *cl_scan, *cl_scan_cap;
 static void *rs_card, *rs_title, *rs_body, *rs_dismiss, *rs_dismiss_cap;
 static void *dl_block, *dl_card, *dl_title, *dl_lead, *dl_details, *dl_warn, *dl_cons, *dl_recov, *dl_cancel, *dl_cancel_cap, *dl_ok, *dl_ok_cap;
 static int obj_count_proxy, obj_count_overview, obj_count_band, obj_count_cell, obj_count_overlay, obj_count_dots;
@@ -2981,6 +3332,9 @@ static void render_cell(void) {
     }
     flag(cl_empty, HIDDEN, !v.empty[0]);
     text(cl_empty, v.empty);
+    pos_c(cl_empty, 12, v.empty_y);
+    caption_centre(cl_scan_cap, 84, 32, v.scan_text, 14);
+    action_style(cl_scan, cl_scan_cap, v.scan_style);
     caption_centre(cl_reset_cap, 104, 44, v.reset_text, 16);
     action_style(cl_reset, cl_reset_cap, v.reset_enabled ? 3 : 0);
     caption_centre(cl_lock_cap, 184, 44, v.lock_text, 16);
@@ -3009,6 +3363,7 @@ static void render_overlay(void) {
         text(dl_recov, v.recovery);
         text(dl_warn, v.warn);
         if (v.warn_bad) paint(dl_warn, 240, 96, 90, 1); else paint(dl_warn, 242, 181, 68, 1);
+        caption_centre(dl_ok_cap, 130, 48, v.ok_cap[0] ? v.ok_cap : "确认下发", 16);
     }
 }
 static int64_t last_render_ms;
@@ -3181,7 +3536,8 @@ static void create_cell(void *parent) {
     cl_pcc_title = label(info, 12, 6, 272, 18, 12, "");
     cl_pcc = label(info, 12, 26, 272, 22, 16, "—");
     cl_lockline = label(info, 12, 52, 272, 20, 12, "");
-    cl_caption = label(cl_page, 16, 132, 292, 18, 12, "");
+    cl_caption = label(cl_page, 16, 132, 200, 18, 12, "");
+    cl_scan = button(cl_page, 224, 126, 84, 32, 42, &cl_scan_cap); curve(cl_scan, 10); outline(cl_scan);
     cell_list = panel(cl_page, 12, 152, 296, 222, 0);
     vlist(cell_list);
     for (int i = 0; i < CELL_ROWS; i++) {
@@ -3259,6 +3615,7 @@ static void create(void *form) {
         pthread_t thread;
         if (!pthread_create(&thread, NULL, worker, NULL)) { pthread_detach(thread); worker_started = 1; }
         if (worker_started && !pthread_create(&thread, NULL, speed_thread, NULL)) pthread_detach(thread);
+        if (worker_started && !pthread_create(&thread, NULL, scan_thread, NULL)) pthread_detach(thread);
     }
     timer = F(0x481428, void *, void (*)(void *), unsigned, void *)(tick, 200, NULL);
 #ifndef U60_FAKE_LVGL

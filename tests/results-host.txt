@@ -1,6 +1,3 @@
-info: hang timeout 3097 ms
-info: group delay hang -> 8108 ms
-info: tap->PUT 1 ms, tap->refreshed 20 ms
 104 passed, 0 failed
-info: objects overview 43 proxy 175 band 129 cell 46 overlay 18 dots 4 total 415 / pool 431
-179 passed, 0 failed
+info: objects overview 43 proxy 175 band 129 cell 96 overlay 18 dots 4 total 465 / pool 481
+205 passed, 0 failed
