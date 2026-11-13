@@ -1,0 +1,7 @@
+*.o
+*.tmp
+*.log
+.DS_Store
+tests/test_logic
+tests/test_ui
+tests/mock.log
